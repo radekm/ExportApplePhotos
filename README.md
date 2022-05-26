@@ -13,6 +13,9 @@ ExportApplePhotos dest-dir dest-dir-deleted
 - The second directory `dest-dir-deleted` is optional
   and if it is given it is used to export all deleted assets.
 
+Note that the program needs permission to read phothos.
+This permission can be set up in System Preferences, Security & Privacy, Privacy.
+
 ## File names
 
 Names of exported files have following pattern:
