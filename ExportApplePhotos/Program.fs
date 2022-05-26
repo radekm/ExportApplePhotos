@@ -83,7 +83,7 @@ module DirectoryWithPhotos =
         |> List.filter (fun file ->
             // Retain only photos and videos
             (Path.GetExtension file).ToLowerInvariant() <> ".aae")
-        |> List.map (fun file ->
+        |> List.choose (fun file ->
              let dirs = ImageMetadataReader.ReadMetadata file
              let readTag dir tag =
                  dirs
@@ -96,23 +96,29 @@ module DirectoryWithPhotos =
                      | [] -> None
                      | [desc] -> Some desc
                      | descs -> failwith $"Tag %s{dir}/%s{tag} in file %s{file} has multiple values: %A{descs}"
-             { Path = file
-               TimeZone = readTag "Exif SubIFD" "Time Zone"
-               CreatedDate =
-                   match readTag "Exif SubIFD" "Date/Time Original", readTag "QuickTime Movie Header" "Created" with
-                   | Some s, None -> parseDateTime s "yyyy:MM:dd HH:mm:ss"  // For photos
-                   | None, Some s -> parseDateTime s "ddd MMM dd HH:mm:ss yyyy"  // For videos
-                   | _ -> failwith $"Unable to get single created date for file %s{file}"
-               ContentId =
-                   match
-                       readTag "Apple Makernote" "Content Identifier",
-                       readTag "QuickTime Metadata Header" "Content Identifier" with
-                   | None, None -> None
-                   | Some s, None -> Some s  // For photos
-                   | None, Some s -> Some s  // For videos
-                   | _ -> failwith $"Content id defined twice in file %s{file}"
-               BurstId = readTag "Apple Makernote" "Burst UUID"
-             })
+             let createdDate =
+                 match readTag "Exif SubIFD" "Date/Time Original", readTag "QuickTime Movie Header" "Created" with
+                 | None, None ->
+                     printfn $"Skipping file because it has no created date: %s{file}"
+                     None
+                 | Some s, None -> Some (parseDateTime s "yyyy:MM:dd HH:mm:ss")  // For photos
+                 | None, Some s -> Some (parseDateTime s "ddd MMM dd HH:mm:ss yyyy")  // For videos
+                 | Some _, Some _ -> failwith $"Multiple created dates for file %s{file}"
+             createdDate
+             |> Option.map (fun createdDate ->
+                 { Path = file
+                   TimeZone = readTag "Exif SubIFD" "Time Zone"
+                   CreatedDate = createdDate
+                   ContentId =
+                       match
+                           readTag "Apple Makernote" "Content Identifier",
+                           readTag "QuickTime Metadata Header" "Content Identifier" with
+                       | None, None -> None
+                       | Some s, None -> Some s  // For photos
+                       | None, Some s -> Some s  // For videos
+                       | _ -> failwith $"Content id defined twice in file %s{file}"
+                   BurstId = readTag "Apple Makernote" "Burst UUID"
+                 }))
 
 [<RequireQualifiedAccess>]
 type Asset =
