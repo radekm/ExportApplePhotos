@@ -101,8 +101,10 @@ module DirectoryWithPhotos =
                  | None, None ->
                      printfn $"Skipping file because it has no created date: %s{file}"
                      None
-                 | Some s, None -> Some (parseDateTime s "yyyy:MM:dd HH:mm:ss")  // For photos
-                 | None, Some s -> Some (parseDateTime s "ddd MMM dd HH:mm:ss yyyy")  // For videos
+                 // For photos. Photos have local time.
+                 | Some s, None -> Some (parseDateTime s "yyyy:MM:dd HH:mm:ss")
+                 // For videos. Videos have UTC time.
+                 | None, Some s -> Some (parseDateTime s "ddd MMM dd HH:mm:ss yyyy")
                  | Some _, Some _ -> failwith $"Multiple created dates for file %s{file}"
              createdDate
              |> Option.map (fun createdDate ->
@@ -114,8 +116,8 @@ module DirectoryWithPhotos =
                            readTag "Apple Makernote" "Content Identifier",
                            readTag "QuickTime Metadata Header" "Content Identifier" with
                        | None, None -> None
-                       | Some s, None -> Some s  // For photos
-                       | None, Some s -> Some s  // For videos
+                       | Some s, None -> Some s  // For photos.
+                       | None, Some s -> Some s  // For videos.
                        | _ -> failwith $"Content id defined twice in file %s{file}"
                    BurstId = readTag "Apple Makernote" "Burst UUID"
                  }))
@@ -139,7 +141,7 @@ let filesToAssets (files : File list) =
     live
     |> List.groupBy (fun live -> live.ContentId.Value)
     |> List.map (fun (contentId, live) ->
-        let photo, video = live |> List.partition (fun live -> Path.GetExtension live.Path = ".mov")
+        let video, photo = live |> List.partition (fun live -> Path.GetExtension live.Path = ".mov")
         match photo, video with
         | [photo], [video] -> Asset.LivePhoto (photo, video)
         | [photo], [] -> Asset.Other photo
@@ -235,6 +237,9 @@ let main argv =
         numberedAssets
         |> List.iter (fun (asset, i) ->
             let file = asset.File
+            // TODO: `CreatedDate` for videos is in UTC and we should convert it to local time.
+            //       For videos unfortunately local timezone is not in EXIF metadata.
+            //       Maybe local timezone could be deduced from location or maybe it's stored in `Phothos.sqlite`.
             let date = file.CreatedDate.ToString("yyyyMMdd_HHmmss")
             // Numbers ensure that `newFileName`s are unique.
             let number =
