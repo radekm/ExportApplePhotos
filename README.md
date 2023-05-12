@@ -57,3 +57,13 @@ and videos as well. The differences are:
 
   `_iOS` part seems of no use to me. And `extension` doesn't have
   normalized case.
+
+
+## About license
+
+License of this project looks like the 3-clause BSD License
+but it has additional conditions:
+
+- This software must not be used for military purposes.
+- Source code must not be used for training or validating AI models.
+  For example AI models which generate source code.
