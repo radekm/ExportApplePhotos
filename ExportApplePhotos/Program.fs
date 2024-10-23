@@ -10,49 +10,82 @@ let toMap getKey items =
     |> List.groupBy getKey
     |> List.map (function
         | key, [item] -> key, item
-        | key, items -> failwith $"Multiple items with same key %s{key}: %A{items}")
+        | key, items -> failwith $"Multiple items with same key %A{key}: %A{items}")
     |> Map.ofList
 
 type FileName = string
+type Directory = string
 type Metadata = { FileName : FileName
+                  Directory : Directory
                   OrigFileName : string
                   Deleted : bool
+                  // Sample data: `2024-06-18 00:16:25`.
+                  DateCreatedUtc : string
+                  // Sample data: `2024:06:17 18:16:25`.
+                  ExifTimestampLocal : string option
+                  // Adding `TimeZoneOffsetSeconds` to `DateCreatedUtc`
+                  // should result in `ExifTimestampLocal`.
+                  TimeZoneOffsetSeconds : int64
+                  OriginalFileSize : int64
                 }
 
 module PhotoDatabase =
     type private MetadataRaw = { FileName : FileName
+                                 Directory : Directory
                                  OrigFileName : string
                                  TrashedState : string
+                                 Complete : int64
+                                 DateCreated : string
+                                 ExifTimestampString : string
+                                 TimeZoneOffset : int64
+                                 TimeZoneName : string  // Is it useful for anything?
+                                 OriginalFileSize : int64
                                }
 
     /// Query tables `ZASSET` and `ZADDITIONALASSETATTRIBUTES` in `Phothos.sqlite` database.
-    let queryMetadata dbFile : Map<FileName, Metadata> =
+    let queryMetadata dbFile : Map<Directory * FileName, Metadata> =
         let conStr = $"Data Source=%s{dbFile}"
         use con = new SqliteConnection(conStr)
         con.Open()
         let query = """
             select
                 ZFILENAME as 'FileName',
+                ZDIRECTORY as 'Directory',
                 ZADDITIONALASSETATTRIBUTES.ZORIGINALFILENAME as 'OrigFileName',
                 case ZTRASHEDSTATE
                     when 1 then 'deleted'
                     when 0 then 'not deleted'
                     else 'unknown ' || ZTRASHEDSTATE
-                end as 'TrashedState'
+                end as 'TrashedState',
+                ZCOMPLETE as 'Complete',
+                datetime('2001-01-01', ZDATECREATED || ' seconds') as 'DateCreated',
+                ZADDITIONALASSETATTRIBUTES.ZEXIFTIMESTAMPSTRING as 'ExifTimestampString',
+                ZADDITIONALASSETATTRIBUTES.ZTIMEZONEOFFSET as 'TimeZoneOffset',
+                ZADDITIONALASSETATTRIBUTES.ZTIMEZONENAME as 'TimeZoneName',
+                ZADDITIONALASSETATTRIBUTES.ZORIGINALFILESIZE as 'OriginalFileSize'
             from ZASSET
             join ZADDITIONALASSETATTRIBUTES on ZASSET.ZADDITIONALATTRIBUTES = ZADDITIONALASSETATTRIBUTES.Z_PK
         """
         con.Query<MetadataRaw>(query)
         |> List.ofSeq
-        |> List.map (fun raw -> { FileName = raw.FileName
-                                  OrigFileName = raw.OrigFileName
-                                  Deleted =
-                                      match raw.TrashedState with
-                                      | "deleted" -> true
-                                      | "not deleted" -> false
-                                      | _ -> failwith $"Unknown trashed stated: %A{raw}"
-                                })
-        |> toMap (fun metadata -> metadata.FileName)
+        |> List.map (fun raw ->
+            if raw.Complete <> 1 then
+                failwithf "Asset not complete (it's probably not stored locally): %A" raw
+
+            { FileName = raw.FileName
+              Directory = raw.Directory
+              OrigFileName = raw.OrigFileName
+              Deleted =
+                  match raw.TrashedState with
+                  | "deleted" -> true
+                  | "not deleted" -> false
+                  | _ -> failwith $"Unknown trashed stated: %A{raw}"
+              DateCreatedUtc = raw.DateCreated
+              ExifTimestampLocal = raw.ExifTimestampString |> Option.ofObj
+              TimeZoneOffsetSeconds = raw.TimeZoneOffset
+              OriginalFileSize = raw.OriginalFileSize
+            })
+        |> toMap (fun metadata -> metadata.Directory, metadata.FileName)
 
 type File = { Path : string
               TimeZone : string option
@@ -61,13 +94,13 @@ type File = { Path : string
               BurstId : string option
             }
 
-module DirectoryWithPhotos =
-    let private parseDateTime s format =
-        DateTime.ParseExact(
-            s,
-            format,
-            System.Globalization.CultureInfo.InvariantCulture.DateTimeFormat)
+let private parseDateTime s format =
+    DateTime.ParseExact(
+        s,
+        format,
+        System.Globalization.CultureInfo.InvariantCulture.DateTimeFormat)
 
+module DirectoryWithPhotos =
     let private listRec dir =
         let result = ResizeArray()
         let rec list dir =
@@ -157,6 +190,9 @@ let copyFileAndPreserveTimestamps (source : string) (dest : string) =
     destInfo.LastWriteTime <- sourceInfo.LastWriteTime
     destInfo.LastAccessTime <- sourceInfo.LastAccessTime
 
+let almostSameDate (a : DateTime) (b : DateTime) =
+    Math.Abs(a.Ticks - b.Ticks) <= TimeSpan.TicksPerSecond
+
 [<EntryPoint>]
 let main argv =
     let destDir, destDirDeleted =
@@ -190,10 +226,41 @@ let main argv =
     //files |> List.iter (printfn "%A")
 
     let getMetadataForFile (file : File) =
+        let dirName = Path.GetFileName (Path.GetDirectoryName file.Path)
         let fileName = Path.GetFileName file.Path
         metadata
-        |> Map.tryFind fileName
-    let getOrigFileName = getMetadataForFile >> Option.map (fun metadata -> metadata.OrigFileName)
+        |> Map.find (dirName, fileName)
+    let getOrigFileName (file : File) = (getMetadataForFile file).OrigFileName
+    let getCreatedDateLocal (file : File) =
+        let metadata = getMetadataForFile file
+        let createdUtc = parseDateTime metadata.DateCreatedUtc "yyyy-MM-dd HH:mm:ss"
+        let createdLocal = createdUtc.AddSeconds(float metadata.TimeZoneOffsetSeconds)
+        // Check result with `ExifTimestampLocal`.
+        match metadata.ExifTimestampLocal with
+        | None -> ()
+        | Some exifLocal ->
+            let exifLocal = parseDateTime exifLocal "yyyy:MM:dd HH:mm:ss"
+            if exifLocal <> createdLocal then
+                failwithf "File %A with metadata %A has created local %A which is different from exif local %A"
+                    file metadata createdLocal exifLocal
+        // Check result with `file.CreatedDate`
+        // where videos have UTC time and other assets have local time.
+        // I don't know why iPhone doesn't store timestamp for videos in the same timezone
+        // as timestamp for photos.
+        if file.Path.ToLowerInvariant().EndsWith ".mov" then
+            // For some reason these timestamps differ by 1 second
+            // so we can't compare them with `<>`.
+            if not (almostSameDate createdUtc file.CreatedDate) then
+                // Expect UTC time.
+                failwithf "Video %A with metadata %A has created utc %A which is different from file time %A"
+                    file metadata createdUtc file.CreatedDate
+        else
+            if createdLocal <> file.CreatedDate then
+                // Expect local time.
+                failwithf "Photo %A with metadata %A has created local %A which is different from file time %A"
+                    file metadata createdLocal file.CreatedDate
+
+        createdLocal
 
     // Assets in unique ordering by:
     // - created date,
@@ -202,7 +269,7 @@ let main argv =
         filesToAssets files
         |> List.groupBy (fun asset ->
             let file = asset.File
-            file.CreatedDate, getOrigFileName file)
+            getCreatedDateLocal file, getOrigFileName file)
         |> List.map (function
             | key, [asset] -> key, asset
             // Unique key guarantees unique ordering.
@@ -229,18 +296,21 @@ let main argv =
         numberedAssets
         |> List.partition (fun (asset, _) ->
             let file = asset.File
-            let deleted = getMetadataForFile file |> Option.map (fun metadata -> metadata.Deleted)
-            deleted = Some true)
+            (getMetadataForFile file).Deleted)
 
     // Copies `numberedAssets` to directory `destDir`.
     let copyAssetsTo (numberedAssets : list<Asset * int>) destDir =
         numberedAssets
         |> List.iter (fun (asset, i) ->
             let file = asset.File
-            // TODO: `CreatedDate` for videos is in UTC and we should convert it to local time.
-            //       For videos unfortunately local timezone is not in EXIF metadata.
-            //       Maybe local timezone could be deduced from location or maybe it's stored in `Phothos.sqlite`.
-            let date = file.CreatedDate.ToString("yyyyMMdd_HHmmss")
+
+            let fileSize = FileInfo(file.Path).Length
+            let metadata = getMetadataForFile file
+            if metadata.OriginalFileSize <> fileSize then
+                failwithf "Current file size %d differs from original file size %d for file %A"
+                    fileSize metadata.OriginalFileSize file
+
+            let date = (getCreatedDateLocal file).ToString("yyyyMMdd_HHmmss")
             // Numbers ensure that `newFileName`s are unique.
             let number =
                 // We use chars in file names because of:
